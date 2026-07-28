@@ -235,7 +235,9 @@ def generate_schedule(
             model.Add(shift[n, d] == SPECIAL).OnlyEnforceIf(is_special[n, d])
             model.Add(shift[n, d] != SPECIAL).OnlyEnforceIf(is_special[n, d].Not())
 
-    # 개인별 신청 듀티 반영
+    penalty_terms = []
+
+    # 개인별 신청 듀티 반영 및 전/후 날짜 우선순위 로직
     shift_label_map = {}
     for n in NURSES:
         for d in DAYS:
@@ -253,9 +255,23 @@ def generate_schedule(
                     model.Add(shift[n, d] == SPECIAL)
                     shift_label_map[(n, d)] = req_s
 
+                # [★ 오프/연차/공가 신청 날짜 전후 우선순위 로직]
                 if req_s in ["off", "공가", "연차"]:
+                    # 1. 오프 신청 앞날 (d - 1)
                     if d > 1:
+                        # N 절대 금지
                         model.Add(is_N[n, d - 1] == 0)
+                        # 1순위: D or off (기본)
+                        # 2순위: E (약한 페널티 부여하여 되도록 D/off가 오도록 함)
+                        penalty_terms.append(is_E[n, d - 1] * 300)
+
+                    # 2. 오프 신청 뒷날 (d + 1)
+                    if d < num_days:
+                        # 1순위: N or off (기본)
+                        # 2순위: E (약한 페널티)
+                        penalty_terms.append(is_E[n, d + 1] * 300)
+                        # 3순위: D (강한 페널티)
+                        penalty_terms.append(is_D[n, d + 1] * 800)
 
     # 전 달 말일 연계
     for n in JUNIORS:
@@ -288,8 +304,6 @@ def generate_schedule(
                 model.Add(is_off[HN_KEY, d] == 1)
             else:
                 model.Add(is_D[HN_KEY, d] == 1)
-
-    penalty_terms = []
 
     # 근무 인력 고정 조건
     for d in DAYS:
