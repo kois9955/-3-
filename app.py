@@ -1,5 +1,6 @@
 import calendar
 import datetime
+import math
 import holidays
 from ortools.sat.python import cp_model
 import pandas as pd
@@ -24,11 +25,11 @@ with col2:
     month = st.number_input("월 (MONTH)", min_value=1, max_value=12, value=8)
 with col3:
     target_off = st.number_input(
-        "목표 오프(off) 개수",
+        "오프(off) 개수",
         min_value=1,
         max_value=15,
-        value=8,
-        help="간호사당 목표 휴무일 수 (최우선 반영하되, 불가피할 경우 -OFF 가능)",
+        value=9,
+        help="간호사당 부여할 오프(off) 개수",
     )
 with col4:
     num_nurses = st.number_input(
@@ -77,10 +78,10 @@ num_days = calendar.monthrange(year, month)[1]
 # ---------------------------------------------------------
 # 간호사 동적 생성 및 이름 지정
 # ---------------------------------------------------------
-st.markdown("##### 👥 간호사 이름 설정")
+st.markdown("##### 👥 간호사 이름 설정 👥")
 default_names = ["수간호사"] + [
     f"간호사 {chr(65+i)}" for i in range(num_nurses - 1)
-]  # A, B, C, D...
+]
 
 NURSES = [f"N_{i}" for i in range(num_nurses)]
 DISPLAY_NAME = {}
@@ -93,10 +94,8 @@ for i in range(num_nurses):
             f"간호사 {i+1}", value=default_names[i], key=f"nurse_name_{i}"
         )
 
-# 자동 생성시 기본 사용되는 듀티
-SHIFT_OPTS = ["off", "D", "E", "N"]
-# 수정 및 수동입력용 확장 듀티 항목
-EDIT_SHIFT_OPTS = ["off", "D", "E", "N", "DE", "D2", "N2"]
+SHIFT_OPTS = ["off", "D", "E", "N", "공가", "연차"]
+EDIT_SHIFT_OPTS = ["off", "D", "E", "N", "DE", "D2", "N2", "공가", "연차", "휴가"]
 
 st.divider()
 
@@ -106,6 +105,8 @@ st.divider()
 prev_month = 12 if month == 1 else month - 1
 st.subheader(f"📅 전달({prev_month}월) 마지막 3일간 근무 입력")
 
+PREV_SHIFT_OPTS = ["off", "D", "E", "N", "D2", "N2", "DE", "공가", "연차"]
+
 prev_schedule = {}
 cols_prev = st.columns(min(num_nurses, 5))
 
@@ -114,13 +115,13 @@ for idx, n in enumerate(NURSES):
     with col_target:
         st.markdown(f"**{DISPLAY_NAME[n]}**")
         p29 = st.selectbox(
-            "전달 -2일", SHIFT_OPTS, index=0, key=f"p29_{n}"
+            "전달 -2일", PREV_SHIFT_OPTS, index=0, key=f"p29_{n}"
         )
         p30 = st.selectbox(
-            "전달 -1일", SHIFT_OPTS, index=0, key=f"p30_{n}"
+            "전달 -1일", PREV_SHIFT_OPTS, index=0, key=f"p30_{n}"
         )
         p31 = st.selectbox(
-            "전달 마지막날", SHIFT_OPTS, index=0, key=f"p31_{n}"
+            "전달 마지막날", PREV_SHIFT_OPTS, index=0, key=f"p31_{n}"
         )
         prev_schedule[n] = [p29, p30, p31]
 
@@ -186,15 +187,13 @@ st.divider()
 
 
 # ---------------------------------------------------------
-# 4. CP-SAT 근무표 생성 함수 (만족도 최고 수준 최적화)
+# 4. CP-SAT 근무표 생성 함수
 # ---------------------------------------------------------
 def generate_schedule(
     YEAR, MONTH, HOLIDAYS, PREV_SCHED, REQ_SHIFTS, TARGET_OFF
 ):
-    OFF, DAY, EVE, NGT = 0, 1, 2, 3
-    SHIFT_LABEL = {OFF: "off", DAY: "D", EVE: "E", NGT: "N"}
-    LABEL_TO_INT = {"off": OFF, "D": DAY, "E": EVE, "N": NGT}
-
+    OFF, DAY, EVE, NGT, SPECIAL = 0, 1, 2, 3, 4
+    
     num_days = calendar.monthrange(YEAR, MONTH)[1]
     DAYS = list(range(1, num_days + 1))
     weekday_of = {
@@ -205,18 +204,26 @@ def generate_schedule(
         return weekday_of[d] in (5, 6) or d in HOLIDAYS
 
     model = cp_model.CpModel()
-    HN_KEY = NURSES[0]  # 첫 번째 간호사를 수간호사로 지정
-    JUNIORS = [n for n in NURSES if n != HN_KEY]
+    HN_KEY = NURSES[0]  # 수간호사
+    JUNIORS = [n for n in NURSES if n != HN_KEY]  # 순서대로 A, B, C, D...
+    num_juniors = len(JUNIORS)
 
-    shift, is_off, is_D, is_E, is_N = {}, {}, {}, {}, {}
+    shift, is_off, is_D, is_E, is_N, is_special = {}, {}, {}, {}, {}, {}
 
     for n in NURSES:
         for d in DAYS:
-            shift[n, d] = model.NewIntVar(0, 3, f"shift_{n}_{d}")
+            req = REQ_SHIFTS.get(n, {}).get(d)
+            if req in ["공가", "연차"]:
+                shift[n, d] = model.NewIntVar(0, 4, f"shift_{n}_{d}")
+            else:
+                shift[n, d] = model.NewIntVar(0, 3, f"shift_{n}_{d}")
+
             is_off[n, d] = model.NewBoolVar(f"off_{n}_{d}")
             is_D[n, d] = model.NewBoolVar(f"D_{n}_{d}")
             is_E[n, d] = model.NewBoolVar(f"E_{n}_{d}")
             is_N[n, d] = model.NewBoolVar(f"N_{n}_{d}")
+            is_special[n, d] = model.NewBoolVar(f"special_{n}_{d}")
+
             model.Add(shift[n, d] == OFF).OnlyEnforceIf(is_off[n, d])
             model.Add(shift[n, d] != OFF).OnlyEnforceIf(is_off[n, d].Not())
             model.Add(shift[n, d] == DAY).OnlyEnforceIf(is_D[n, d])
@@ -225,33 +232,47 @@ def generate_schedule(
             model.Add(shift[n, d] != EVE).OnlyEnforceIf(is_E[n, d].Not())
             model.Add(shift[n, d] == NGT).OnlyEnforceIf(is_N[n, d])
             model.Add(shift[n, d] != NGT).OnlyEnforceIf(is_N[n, d].Not())
+            model.Add(shift[n, d] == SPECIAL).OnlyEnforceIf(is_special[n, d])
+            model.Add(shift[n, d] != SPECIAL).OnlyEnforceIf(is_special[n, d].Not())
 
-    # 개인별 신청 듀티 반영 (최우선 고정)
+    # 개인별 신청 듀티 반영
+    shift_label_map = {}
     for n in NURSES:
-        for req_d, req_s in REQ_SHIFTS.get(n, {}).items():
-            target_val = LABEL_TO_INT[req_s]
-            model.Add(shift[n, req_d] == target_val)
+        for d in DAYS:
+            req_s = REQ_SHIFTS.get(n, {}).get(d)
+            if req_s:
+                if req_s == "off":
+                    model.Add(shift[n, d] == OFF)
+                elif req_s == "D":
+                    model.Add(shift[n, d] == DAY)
+                elif req_s == "E":
+                    model.Add(shift[n, d] == EVE)
+                elif req_s == "N":
+                    model.Add(shift[n, d] == NGT)
+                else:
+                    model.Add(shift[n, d] == SPECIAL)
+                    shift_label_map[(n, d)] = req_s
 
-            if req_s == "off":
-                if req_d > 1:
-                    model.Add(is_N[n, req_d - 1] == 0)
+                if req_s in ["off", "공가", "연차"]:
+                    if d > 1:
+                        model.Add(is_N[n, d - 1] == 0)
 
     # 전 달 말일 연계
     for n in JUNIORS:
-        p29, p30, p31 = [LABEL_TO_INT[x] for x in PREV_SCHED[n]]
+        p29, p30, p31 = PREV_SCHED[n]
 
-        if p31 == NGT:
-            model.AddBoolOr([is_N[n, 1], is_off[n, 1]])
+        if p31 in ["N", "N2"]:
+            model.AddBoolOr([is_N[n, 1], is_off[n, 1], is_special[n, 1]])
 
-        prev_work_count = sum(1 for x in [p29, p30, p31] if x != OFF)
+        prev_work_count = sum(1 for x in [p29, p30, p31] if x not in ["off", "공가", "연차"])
         if prev_work_count > 0:
             max_allowed_first_days = 6 - prev_work_count
             if max_allowed_first_days < 1:
-                model.Add(is_off[n, 1] == 1)
+                model.AddBoolOr([is_off[n, 1] == 1, is_special[n, 1] == 1])
             else:
                 model.Add(
                     sum(
-                        is_off[n, d]
+                        is_off[n, d] + is_special[n, d]
                         for d in range(1, max_allowed_first_days + 1)
                     )
                     >= 1
@@ -270,7 +291,7 @@ def generate_schedule(
 
     penalty_terms = []
 
-    # 근무 인력 고정 조건 (N 1명 고정, E 1명 고정, 주말/공휴일 D 1명 고정)
+    # 근무 인력 고정 조건
     for d in DAYS:
         d_count = sum(is_D[n, d] for n in NURSES)
         e_count = sum(is_E[n, d] for n in NURSES)
@@ -295,33 +316,83 @@ def generate_schedule(
             model.Add(sum(is_N[n, d] for d in window) <= 3)
         for d in DAYS[:-1]:
             model.AddBoolOr(
-                [is_N[n, d].Not(), is_N[n, d + 1], is_off[n, d + 1]]
+                [is_N[n, d].Not(), is_N[n, d + 1], is_off[n, d + 1], is_special[n, d + 1]]
             )
 
-    # 연속 근무 제한 (최대 5일 권장, 6일 한계)
+    # 연속 근무 제한 (최대 5일 권장)
     for n in NURSES:
         for s in range(1, num_days - 5):
             window = range(s, s + 7)
-            model.Add(sum(is_off[n, d] for d in window) >= 1)
+            model.Add(sum(is_off[n, d] + is_special[n, d] for d in window) >= 1)
 
     # 총량 변수
     off_total = {}
     d_total = {}
     e_total = {}
     n_total = {}
+    pay_score = {}  # 수당 가중치 점수 변수
+
     for n in JUNIORS:
         off_total[n] = sum(is_off[n, d] for d in DAYS)
         d_total[n] = sum(is_D[n, d] for d in DAYS)
         e_total[n] = sum(is_E[n, d] for d in DAYS)
         n_total[n] = sum(is_N[n, d] for d in DAYS)
+        
+        # 수당 점수계산: N=2점, E=1점
+        pay_score[n] = model.NewIntVar(0, 100, f"pay_score_{n}")
+        model.Add(pay_score[n] == n_total[n] * 2 + e_total[n])
 
-    # 1순위: 오프(off) 개수 맞추기
+    # 1순위: 오프(off) 개수 제약
     for n in JUNIORS:
+        model.Add(off_total[n] <= TARGET_OFF)
         off_diff = model.NewIntVar(-31, 31, f"off_diff_{n}")
-        model.Add(off_diff == off_total[n] - TARGET_OFF)
-        abs_off_diff = model.NewIntVar(0, 31, f"abs_off_diff_{n}")
-        model.AddAbsEquality(abs_off_diff, off_diff)
-        penalty_terms.append(abs_off_diff * 3000)
+        model.Add(off_diff == TARGET_OFF - off_total[n])
+        penalty_terms.append(off_diff * 3000)
+
+    # N(나이트) 및 E(이브닝) 개수 최소/최대 범위 제약 (몰림 방지)
+    if num_juniors > 0:
+        # 나이트 균등 범위 (평균 ±2개)
+        avg_n = num_days / num_juniors
+        min_n_allowed = max(0, math.floor(avg_n) - 1)
+        max_n_allowed = math.ceil(avg_n) + 1
+        
+        # 이브닝 균등 범위 (평균 ±2개)
+        avg_e = num_days / num_juniors
+        min_e_allowed = max(0, math.floor(avg_e) - 1)
+        max_e_allowed = math.ceil(avg_e) + 1
+
+        for n in JUNIORS:
+            model.Add(n_total[n] >= min_n_allowed)
+            model.Add(n_total[n] <= max_n_allowed)
+            
+            model.Add(e_total[n] >= min_e_allowed)
+            model.Add(e_total[n] <= max_e_allowed)
+
+    # 선배 -> 후배 수당 점수 순서 유지 + N/E 격차 페널티
+    for i in range(num_juniors - 1):
+        senior = JUNIORS[i]
+        junior = JUNIORS[i + 1]
+        # 선배 수당 점수 >= 후배 수당 점수 (역전 방지)
+        model.Add(pay_score[senior] >= pay_score[junior])
+
+    # 간호사 간 N 및 E 개수 차이에 페널티 부여
+    for i in range(num_juniors):
+        for j in range(i + 1, num_juniors):
+            n1, n2 = JUNIORS[i], JUNIORS[j]
+            
+            # 나이트 격차
+            ndiff = model.NewIntVar(-31, 31, f"ndiff_{n1}_{n2}")
+            model.Add(ndiff == n_total[n1] - n_total[n2])
+            abs_ndiff = model.NewIntVar(0, 31, f"abs_ndiff_{n1}_{n2}")
+            model.AddAbsEquality(abs_ndiff, ndiff)
+            penalty_terms.append(abs_ndiff * 800)
+
+            # 이브닝 격차
+            ediff = model.NewIntVar(-31, 31, f"ediff_{n1}_{n2}")
+            model.Add(ediff == e_total[n1] - e_total[n2])
+            abs_ediff = model.NewIntVar(0, 31, f"abs_ediff_{n1}_{n2}")
+            model.AddAbsEquality(abs_ediff, ediff)
+            penalty_terms.append(abs_ediff * 800)
 
     # E->D 역교대 강력 금지
     for n in JUNIORS:
@@ -333,12 +404,9 @@ def generate_schedule(
             ).OnlyEnforceIf(bad.Not())
             penalty_terms.append(bad * 3000)
 
-    # ---------------------------------------------------------
-    # 🔥 [핵심 개선] 퐁당퐁당 완전 차단 & 연속 오프(휴식) 가중치 강화
-    # ---------------------------------------------------------
+    # 퐁당퐁당 차단 & 연속 오프 가중치
     for n in JUNIORS:
         for d in range(2, num_days):
-            # 1. 퐁당 오프 (근무 - 오프 - 근무) ➔ 강력 벌점
             single_off = model.NewBoolVar(f"soff_{n}_{d}")
             model.AddBoolAnd(
                 [is_off[n, d - 1].Not(), is_off[n, d], is_off[n, d + 1].Not()]
@@ -348,7 +416,6 @@ def generate_schedule(
             ).OnlyEnforceIf(single_off.Not())
             penalty_terms.append(single_off * 2500)
 
-            # 2. 퐁당 근무 (오프 - 근무 - 오프) ➔ 강력 벌점
             single_work = model.NewBoolVar(f"swork_{n}_{d}")
             model.AddBoolAnd(
                 [is_off[n, d - 1], is_off[n, d].Not(), is_off[n, d + 1]]
@@ -358,7 +425,6 @@ def generate_schedule(
             ).OnlyEnforceIf(single_work.Not())
             penalty_terms.append(single_work * 2500)
 
-        # 3. 붙어서 쉬는 2연속 오프(Double Off) 선호 ➔ 포상(보너스) 점수 부여
         for d in range(1, num_days):
             double_off = model.NewBoolVar(f"doff_{n}_{d}")
             model.AddBoolAnd([is_off[n, d], is_off[n, d + 1]]).OnlyEnforceIf(
@@ -367,35 +433,12 @@ def generate_schedule(
             model.AddBoolOr(
                 [is_off[n, d].Not(), is_off[n, d + 1].Not()]
             ).OnlyEnforceIf(double_off.Not())
-            # 연속 오프시 마이너스 벌점(=우대)
             penalty_terms.append(double_off * -500)
-
-    # 간호사 간 각 듀티 개수 균등 배분
-    for i in range(len(JUNIORS)):
-        for j in range(i + 1, len(JUNIORS)):
-            n1, n2 = JUNIORS[i], JUNIORS[j]
-
-            odiff = model.NewIntVar(-31, 31, f"odiff_{n1}_{n2}")
-            model.Add(odiff == off_total[n1] - off_total[n2])
-            abs_odiff = model.NewIntVar(0, 31, f"abs_odiff_{n1}_{n2}")
-            model.AddAbsEquality(abs_odiff, odiff)
-            penalty_terms.append(abs_odiff * 500)
-
-            for shift_tot, label in [
-                (d_total, "d"),
-                (e_total, "e"),
-                (n_total, "n"),
-            ]:
-                sdiff = model.NewIntVar(-31, 31, f"{label}diff_{n1}_{n2}")
-                model.Add(sdiff == shift_tot[n1] - shift_tot[n2])
-                abs_sdiff = model.NewIntVar(0, 31, f"abs_{label}diff_{n1}_{n2}")
-                model.AddAbsEquality(abs_sdiff, sdiff)
-                penalty_terms.append(abs_sdiff * 300)
 
     model.Minimize(sum(penalty_terms))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 15.0  # 정교한 연산을 위해 탐색 시간 15초로 상향
+    solver.parameters.max_time_in_seconds = 20.0
     solver.parameters.num_search_workers = 2
     status = solver.Solve(model)
 
@@ -406,9 +449,16 @@ def generate_schedule(
             for d in DAYS
         ]
 
+        base_shift_label = {OFF: "off", DAY: "D", EVE: "E", NGT: "N"}
         data = []
         for n in NURSES:
-            row = [SHIFT_LABEL[solver.Value(shift[n, d])] for d in DAYS]
+            row = []
+            for d in DAYS:
+                val = solver.Value(shift[n, d])
+                if val == SPECIAL:
+                    row.append(shift_label_map.get((n, d), "공가"))
+                else:
+                    row.append(base_shift_label[val])
             data.append([DISPLAY_NAME[n]] + row)
 
         return pd.DataFrame(data, columns=["구분"] + cols)
@@ -420,7 +470,7 @@ def generate_schedule(
 # 5. 실행 및 결과 출력
 # ---------------------------------------------------------
 if st.button("🚀 맞춤 근무표 생성하기", type="primary"):
-    with st.spinner("근무 만족도 및 연속 오프 패턴 최적화 계산 중..."):
+    with st.spinner("근무표 생성중..."):
         df_result = generate_schedule(
             year,
             month,
@@ -444,7 +494,7 @@ if "current_schedule_df" in st.session_state:
     st.markdown("---")
     st.subheader("📋 근무표 수정 및 확인")
     st.caption(
-        "💡 **[위쪽 입력창]**에서 듀티를 직접 수정하시면, **[아래쪽 표]에서 연한 빨강 형광펜과 D/E/N/off 합계가 즉시 실시간 업데이트**됩니다."
+        "💡 **[위쪽 입력창]**에서 듀티를 직접 수정하시면, **[아래쪽 표]에서 분홍색 바탕에 진한 빨간색 글씨와 D/E/N/off 합계가 즉시 실시간 업데이트**됩니다."
     )
 
     df_current = st.session_state.current_schedule_df
@@ -454,7 +504,6 @@ if "current_schedule_df" in st.session_state:
         if c not in ["구분", "D", "E", "N", "off"]
     ]
 
-    # 날짜 컬럼 드롭다운 수정 설정
     column_config = {
         "구분": st.column_config.TextColumn("구분", disabled=True)
     }
@@ -465,7 +514,6 @@ if "current_schedule_df" in st.session_state:
 
     raw_date_df = df_current[["구분"] + date_cols]
 
-    # 1. 듀티 수정용 에디터
     edited_date_df = st.data_editor(
         raw_date_df,
         column_config=column_config,
@@ -474,8 +522,6 @@ if "current_schedule_df" in st.session_state:
         key="schedule_editor",
     )
 
-
-    # D, E, N, off 합계 실시간 계산 함수
     def calc_totals(row):
         vals = list(row[date_cols])
         return pd.Series(
@@ -487,27 +533,21 @@ if "current_schedule_df" in st.session_state:
             ]
         )
 
-
     totals_df = edited_date_df.apply(calc_totals, axis=1)
     totals_df.columns = ["D", "E", "N", "off"]
 
-    # 수정된 데이터 + 실시간 합계 결합
     final_df = pd.concat([edited_date_df, totals_df], axis=1)
 
-
-    # off 셀 연한 빨강 형광펜 서식 함수
     def style_off(val):
-        if str(val).strip().lower() == "off":
+        v = str(val).strip().lower()
+        if v in ["off", "공가", "연차", "휴가"]:
             return "background-color: #FFD2D2; color: #D8000C; font-weight: bold;"
         return ""
 
-
     styled_final_df = final_df.style.map(style_off)
 
-    # 2. 형광펜 및 실시간 합계가 포함된 최종 렌더링 표
     st.dataframe(styled_final_df, use_container_width=True, hide_index=True)
 
-    # 3. 엑셀 다운로드 버튼
     csv_data = final_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label="📥 최종 근무표 엑셀(CSV) 다운로드",
