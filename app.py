@@ -186,7 +186,7 @@ st.divider()
 
 
 # ---------------------------------------------------------
-# 4. CP-SAT 근무표 생성 함수
+# 4. CP-SAT 근무표 생성 함수 (만족도 최고 수준 최적화)
 # ---------------------------------------------------------
 def generate_schedule(
     YEAR, MONTH, HOLIDAYS, PREV_SCHED, REQ_SHIFTS, TARGET_OFF
@@ -226,7 +226,7 @@ def generate_schedule(
             model.Add(shift[n, d] == NGT).OnlyEnforceIf(is_N[n, d])
             model.Add(shift[n, d] != NGT).OnlyEnforceIf(is_N[n, d].Not())
 
-    # 개인별 신청 듀티 반영
+    # 개인별 신청 듀티 반영 (최우선 고정)
     for n in NURSES:
         for req_d, req_s in REQ_SHIFTS.get(n, {}).items():
             target_val = LABEL_TO_INT[req_s]
@@ -276,17 +276,13 @@ def generate_schedule(
         e_count = sum(is_E[n, d] for n in NURSES)
         n_count = sum(is_N[n, d] for n in NURSES)
 
-        # 절대 규칙: E와 N은 무조건 하루에 딱 1명씩만 배치
         model.Add(e_count == 1)
         model.Add(n_count == 1)
 
         if is_special_day(d):
-            # 주말/공휴일 데이(D)는 무조건 1명 고정
             model.Add(d_count == 1)
         else:
-            # 평일 데이(D): 최소 1명 이상은 필수
             model.Add(d_count >= 1)
-            # 2순위: 평일 데이(D) 2명 선호 (1명일 경우 소량의 벌점 부여)
             is_d_less_than_2 = model.NewBoolVar(f"d_less_2_{d}")
             model.Add(d_count < 2).OnlyEnforceIf(is_d_less_than_2)
             model.Add(d_count >= 2).OnlyEnforceIf(is_d_less_than_2.Not())
@@ -302,7 +298,7 @@ def generate_schedule(
                 [is_N[n, d].Not(), is_N[n, d + 1], is_off[n, d + 1]]
             )
 
-    # 연속 근무 제한 (최대 6일)
+    # 연속 근무 제한 (최대 5일 권장, 6일 한계)
     for n in NURSES:
         for s in range(1, num_days - 5):
             window = range(s, s + 7)
@@ -319,16 +315,15 @@ def generate_schedule(
         e_total[n] = sum(is_E[n, d] for d in DAYS)
         n_total[n] = sum(is_N[n, d] for d in DAYS)
 
-    # 1순위: 오프(off) 개수 맞추기 (최우선하되, 불가능할 경우 -OFF 허용)
+    # 1순위: 오프(off) 개수 맞추기
     for n in JUNIORS:
         off_diff = model.NewIntVar(-31, 31, f"off_diff_{n}")
         model.Add(off_diff == off_total[n] - TARGET_OFF)
         abs_off_diff = model.NewIntVar(0, 31, f"abs_off_diff_{n}")
         model.AddAbsEquality(abs_off_diff, off_diff)
-        # 오프 개수가 모자라거나 넘칠수록 점수 감점 (우선순위 1위)
-        penalty_terms.append(abs_off_diff * 1500)
+        penalty_terms.append(abs_off_diff * 3000)
 
-    # E->D 역교대 방지
+    # E->D 역교대 강력 금지
     for n in JUNIORS:
         for d in DAYS[:-1]:
             bad = model.NewBoolVar(f"ED_{n}_{d}")
@@ -336,11 +331,14 @@ def generate_schedule(
             model.AddBoolOr(
                 [is_E[n, d].Not(), is_D[n, d + 1].Not()]
             ).OnlyEnforceIf(bad.Not())
-            penalty_terms.append(bad * 1000)
+            penalty_terms.append(bad * 3000)
 
-    # 퐁당퐁당 패턴 방지
+    # ---------------------------------------------------------
+    # 🔥 [핵심 개선] 퐁당퐁당 완전 차단 & 연속 오프(휴식) 가중치 강화
+    # ---------------------------------------------------------
     for n in JUNIORS:
         for d in range(2, num_days):
+            # 1. 퐁당 오프 (근무 - 오프 - 근무) ➔ 강력 벌점
             single_off = model.NewBoolVar(f"soff_{n}_{d}")
             model.AddBoolAnd(
                 [is_off[n, d - 1].Not(), is_off[n, d], is_off[n, d + 1].Not()]
@@ -348,8 +346,9 @@ def generate_schedule(
             model.AddBoolOr(
                 [is_off[n, d - 1], is_off[n, d].Not(), is_off[n, d + 1]]
             ).OnlyEnforceIf(single_off.Not())
-            penalty_terms.append(single_off * 300)
+            penalty_terms.append(single_off * 2500)
 
+            # 2. 퐁당 근무 (오프 - 근무 - 오프) ➔ 강력 벌점
             single_work = model.NewBoolVar(f"swork_{n}_{d}")
             model.AddBoolAnd(
                 [is_off[n, d - 1], is_off[n, d].Not(), is_off[n, d + 1]]
@@ -357,7 +356,19 @@ def generate_schedule(
             model.AddBoolOr(
                 [is_off[n, d - 1].Not(), is_off[n, d], is_off[n, d + 1].Not()]
             ).OnlyEnforceIf(single_work.Not())
-            penalty_terms.append(single_work * 300)
+            penalty_terms.append(single_work * 2500)
+
+        # 3. 붙어서 쉬는 2연속 오프(Double Off) 선호 ➔ 포상(보너스) 점수 부여
+        for d in range(1, num_days):
+            double_off = model.NewBoolVar(f"doff_{n}_{d}")
+            model.AddBoolAnd([is_off[n, d], is_off[n, d + 1]]).OnlyEnforceIf(
+                double_off
+            )
+            model.AddBoolOr(
+                [is_off[n, d].Not(), is_off[n, d + 1].Not()]
+            ).OnlyEnforceIf(double_off.Not())
+            # 연속 오프시 마이너스 벌점(=우대)
+            penalty_terms.append(double_off * -500)
 
     # 간호사 간 각 듀티 개수 균등 배분
     for i in range(len(JUNIORS)):
@@ -368,7 +379,7 @@ def generate_schedule(
             model.Add(odiff == off_total[n1] - off_total[n2])
             abs_odiff = model.NewIntVar(0, 31, f"abs_odiff_{n1}_{n2}")
             model.AddAbsEquality(abs_odiff, odiff)
-            penalty_terms.append(abs_odiff * 300)
+            penalty_terms.append(abs_odiff * 500)
 
             for shift_tot, label in [
                 (d_total, "d"),
@@ -379,13 +390,13 @@ def generate_schedule(
                 model.Add(sdiff == shift_tot[n1] - shift_tot[n2])
                 abs_sdiff = model.NewIntVar(0, 31, f"abs_{label}diff_{n1}_{n2}")
                 model.AddAbsEquality(abs_sdiff, sdiff)
-                penalty_terms.append(abs_sdiff * 200)
+                penalty_terms.append(abs_sdiff * 300)
 
     model.Minimize(sum(penalty_terms))
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 10.0
-    solver.parameters.num_search_workers = 1
+    solver.parameters.max_time_in_seconds = 15.0  # 정교한 연산을 위해 탐색 시간 15초로 상향
+    solver.parameters.num_search_workers = 2
     status = solver.Solve(model)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -409,7 +420,7 @@ def generate_schedule(
 # 5. 실행 및 결과 출력
 # ---------------------------------------------------------
 if st.button("🚀 맞춤 근무표 생성하기", type="primary"):
-    with st.spinner("근무표 계산 중..."):
+    with st.spinner("근무 만족도 및 연속 오프 패턴 최적화 계산 중..."):
         df_result = generate_schedule(
             year,
             month,
@@ -421,10 +432,12 @@ if st.button("🚀 맞춤 근무표 생성하기", type="primary"):
 
     if df_result is not None:
         st.session_state.current_schedule_df = df_result
-        st.success(f"✨ {year}년 {month}월 근무표가 완성되었습니다!")
+        st.success(
+            f"✨ {year}년 {month}월 만족도 최적화 근무표가 완성되었습니다!"
+        )
     else:
         st.error(
-            "❌ 입력하신 조건(신청 듀티, 연속 근무 제약 등)이 수급 조건과 완전히 충돌하여 근무표 생성이 불가능합니다. 신청 듀티를 조금 조율해 주세요."
+            "❌ 입력하신 조건(신청 듀티, 필수 인력 등)이 수급 조건과 충돌하여 근무표 생성이 불가능합니다. 신청 듀티를 조금 조율해 주세요."
         )
 
 if "current_schedule_df" in st.session_state:
